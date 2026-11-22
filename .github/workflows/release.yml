@@ -1,0 +1,119 @@
+name: Release
+
+# Image version follows the upstream Roundcube tag from the Dockerfile FROM line
+# plus a revision suffix: e.g. FROM roundcube/roundcubemail:1.6.10-apache -> 1.6.10-apache-r1.
+# Only the immutable version tag is published (no latest / floating tags), so consumers pin explicitly.
+# Builds run when the Dockerfile changes, weekly (only if the base image changed), or manually.
+on:
+  push:
+    branches: [master]
+    paths: [Dockerfile]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          base=$(awk 'toupper($1)=="FROM" {print $2; exit}' Dockerfile)
+          upstream="${base##*:}"
+          if [ "$upstream" = "$base" ]; then
+            echo "::error::Base image '$base' has no tag"
+            exit 1
+          fi
+          digest=$(docker buildx imagetools inspect "$base" --format '{{.Manifest.Digest}}')
+          last=$(git tag -l "${upstream}-r*" | sed "s/^${upstream}-r//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+
+          # Scheduled runs rebuild only when the base image digest differs from the last release.
+          if [ "$EVENT" = "schedule" ] && [ -n "$last" ]; then
+            if gh release view "${upstream}-r${last}" --repo "$REPO" --json body --jq .body | grep -qF "$digest"; then
+              echo "Base image unchanged ($digest), skipping"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          tag="${upstream}-r$(( ${last:-0} + 1 ))"
+          {
+            echo "skip=false"
+            echo "base=$base"
+            echo "digest=$digest"
+            echo "upstream=$upstream"
+            echo "tag=$tag"
+            echo "image=ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        if: steps.ver.outputs.skip != 'true'
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ steps.ver.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.tag }}
+
+      - name: Log in to GHCR
+        if: steps.ver.outputs.skip != 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.ver.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build and push
+        if: steps.ver.outputs.skip != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          push: true
+          pull: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Created only after a successful push, so a failed build leaves no tag behind.
+      - name: Create GitHub release
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          BASE: ${{ steps.ver.outputs.base }}
+          DIGEST: ${{ steps.ver.outputs.digest }}
+          IMAGE: ${{ steps.ver.outputs.image }}
+        run: |
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes \
+            --notes "Image: \`$IMAGE:$TAG\`
+
+          Base image: \`$BASE\`
+          Base digest: \`$DIGEST\`"
